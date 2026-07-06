@@ -1,6 +1,6 @@
 [package]
 name = "rsomics-pca"
-version = "0.1.0"
+version = "0.1.1"
 description = "Principal Component Analysis (PCA) of a feature/sample table — scikit-bio skbio.stats.ordination.pca equivalent (column centering + eigh/SVD decomposition)"
 edition = "2024"
 rust-version = "1.91"

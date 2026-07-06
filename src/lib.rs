@@ -19,7 +19,8 @@ pub struct FeatureTable {
 
 impl FeatureTable {
     /// # Errors
-    /// Errors on a missing header, a ragged body, or a non-numeric cell.
+    /// Errors on a missing header, a ragged body, or a non-numeric or
+    /// non-finite (NaN/inf) cell.
     pub fn parse<R: BufRead>(reader: R, delim: char) -> Result<FeatureTable> {
         let mut lines = reader.lines();
         let header = loop {
@@ -57,13 +58,22 @@ impl FeatureTable {
             let label = fields.next().unwrap_or("").trim().to_string();
             let row_start = data.len();
             for field in fields {
+                let col = data.len() - row_start + 1;
                 let v: f64 = field.trim().parse().map_err(|_| {
                     RsomicsError::InvalidInput(format!(
-                        "sample '{label}', column {}: '{}' is not numeric",
-                        data.len() - row_start + 1,
+                        "sample '{label}', column {col}: '{}' is not numeric",
                         field.trim()
                     ))
                 })?;
+                // skbio delegates to numpy's asarray_chkfinite, which rejects any
+                // non-finite cell; a NaN/inf otherwise silently poisons the whole
+                // decomposition into an all-nan table (eigh) or a solver panic (svd).
+                if !v.is_finite() {
+                    return Err(RsomicsError::InvalidInput(format!(
+                        "sample '{label}', column {col}: '{}' is not finite (PCA input must not contain NaN or inf)",
+                        field.trim()
+                    )));
+                }
                 data.push(v);
             }
             let got = data.len() - row_start;
@@ -118,7 +128,8 @@ pub struct Ordination {
 
 impl Ordination {
     /// # Errors
-    /// Errors when `dimensions` is not in `1..=min(n_samples, n_features)`.
+    /// Errors when there are fewer than 2 samples, when `dimensions` is not in
+    /// `1..=min(n_samples, n_features)`, or when the decomposition fails.
     pub fn compute(
         table: &FeatureTable,
         method: Method,
@@ -126,6 +137,13 @@ impl Ordination {
     ) -> Result<Ordination> {
         let n = table.n_samples();
         let p = table.n_features();
+        // Variance divides by n-1; a single sample makes that 1/0 = inf and the
+        // covariance 0*inf = nan, so skbio raises here rather than emit garbage.
+        if n < 2 {
+            return Err(RsomicsError::InvalidInput(format!(
+                "PCA needs at least 2 samples, got {n}"
+            )));
+        }
         if let Some(d) = dimensions
             && (d == 0 || d > n.min(p))
         {
@@ -140,8 +158,8 @@ impl Ordination {
         let xc = Mat::from_fn(n, p, |i, j| table.data[i * p + j] - col_means[j]);
 
         let (mut variances, components, total_variance) = match method {
-            Method::Eigh => eigh_decompose(&xc, n, p),
-            Method::Svd => svd_decompose(&xc, n, p),
+            Method::Eigh => eigh_decompose(&xc, n, p)?,
+            Method::Svd => svd_decompose(&xc, n, p)?,
         };
 
         if let Some(d) = dimensions {
@@ -233,7 +251,7 @@ impl Ordination {
 
 /// eigh of the covariance Xcᵀ·Xc/(n-1); returns descending variances, the
 /// component rows (`k × p`, row-major), and the total variance (trace of cov).
-fn eigh_decompose(xc: &Mat<f64>, n: usize, p: usize) -> (Vec<f64>, Vec<f64>, f64) {
+fn eigh_decompose(xc: &Mat<f64>, n: usize, p: usize) -> Result<(Vec<f64>, Vec<f64>, f64)> {
     let inv_dof = 1.0 / (n as f64 - 1.0);
     let cov = Mat::from_fn(p, p, |i, j| {
         let mut acc = 0.0;
@@ -243,7 +261,9 @@ fn eigh_decompose(xc: &Mat<f64>, n: usize, p: usize) -> (Vec<f64>, Vec<f64>, f64
         acc * inv_dof
     });
 
-    let eig: SelfAdjointEigen<f64> = cov.self_adjoint_eigen(faer::Side::Lower).unwrap();
+    let eig: SelfAdjointEigen<f64> = cov
+        .self_adjoint_eigen(faer::Side::Lower)
+        .map_err(|e| RsomicsError::UpstreamError(format!("eigendecomposition failed: {e:?}")))?;
     let s = eig.S();
     let u = eig.U();
 
@@ -258,14 +278,16 @@ fn eigh_decompose(xc: &Mat<f64>, n: usize, p: usize) -> (Vec<f64>, Vec<f64>, f64
         }
     }
     let total_variance: f64 = (0..p).map(|i| cov[(i, i)]).sum();
-    (variances, components, total_variance)
+    Ok((variances, components, total_variance))
 }
 
 /// SVD of the centered matrix; variances are σ²/(n-1), components are the right
 /// singular vectors (`min(n,p) × p`), total variance is ‖Xc‖²_F/(n-1).
-fn svd_decompose(xc: &Mat<f64>, n: usize, p: usize) -> (Vec<f64>, Vec<f64>, f64) {
+fn svd_decompose(xc: &Mat<f64>, n: usize, p: usize) -> Result<(Vec<f64>, Vec<f64>, f64)> {
     let inv_dof = 1.0 / (n as f64 - 1.0);
-    let svd: Svd<f64> = xc.svd().unwrap();
+    let svd: Svd<f64> = xc
+        .svd()
+        .map_err(|e| RsomicsError::UpstreamError(format!("SVD failed: {e:?}")))?;
     let sv = svd.S().column_vector();
     let v = svd.V();
     let k = sv.nrows();
@@ -283,7 +305,7 @@ fn svd_decompose(xc: &Mat<f64>, n: usize, p: usize) -> (Vec<f64>, Vec<f64>, f64)
             frob += xc[(s, j)] * xc[(s, j)];
         }
     }
-    (variances, components, frob * inv_dof)
+    Ok((variances, components, frob * inv_dof))
 }
 
 fn write_axis_header<W: Write>(out: &mut W, k: usize) -> Result<()> {
@@ -375,5 +397,34 @@ mod tests {
     fn ragged_row_errors() {
         let bad = "\tA\tB\nS1\t1\nS2\t1\t2\n";
         assert!(FeatureTable::parse(bad.as_bytes(), '\t').is_err());
+    }
+
+    fn parse_err(text: &str) -> String {
+        match FeatureTable::parse(text.as_bytes(), '\t') {
+            Err(e) => format!("{e}"),
+            Ok(_) => panic!("expected parse to fail on: {text:?}"),
+        }
+    }
+
+    #[test]
+    fn nan_cell_rejected() {
+        assert!(parse_err("\tA\tB\nS1\t1\tnan\nS2\t3\t4\n").contains("finite"));
+    }
+
+    #[test]
+    fn inf_cell_rejected() {
+        for tok in ["inf", "-inf", "infinity"] {
+            let msg = parse_err(&format!("\tA\tB\nS1\t1\t{tok}\nS2\t3\t4\n"));
+            assert!(msg.contains("finite"), "{tok}: {msg}");
+        }
+    }
+
+    #[test]
+    fn single_sample_errors() {
+        let one = "\tA\tB\nS1\t1\t2\n";
+        let t = FeatureTable::parse(one.as_bytes(), '\t').unwrap();
+        assert_eq!(t.n_samples(), 1);
+        assert!(Ordination::compute(&t, Method::Eigh, None).is_err());
+        assert!(Ordination::compute(&t, Method::Svd, None).is_err());
     }
 }

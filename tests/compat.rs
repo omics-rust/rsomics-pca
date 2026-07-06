@@ -246,3 +246,50 @@ fn live_svd() {
     against_oracle("rand_6x4.tsv", "svd");
     against_oracle("iris_like.tsv", "svd");
 }
+
+/// scikit-bio raises `ValueError` (numpy `asarray_chkfinite`, or a single-sample
+/// shape/finite check) on these; ours must fail loud too — non-zero exit with a
+/// stderr message — never emit an all-nan table or panic.
+fn fails_loud(table: &str, method: &str, needle: &str) {
+    let out = Command::new(ours_bin())
+        .arg(golden(table))
+        .args(["--method", method])
+        .output()
+        .expect("run rsomics-pca");
+    assert!(
+        !out.status.success(),
+        "{table}/{method}: expected non-zero exit, got success with:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(needle),
+        "{table}/{method}: stderr {stderr:?} missing {needle:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("nan"),
+        "{table}/{method}: emitted an all-nan table instead of failing"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "{table}/{method}: panicked instead of failing cleanly: {stderr}"
+    );
+}
+
+#[test]
+fn nan_input_fails_loud() {
+    fails_loud("nan.tsv", "eigh", "finite");
+    fails_loud("nan.tsv", "svd", "finite");
+}
+
+#[test]
+fn inf_input_fails_loud() {
+    fails_loud("inf.tsv", "eigh", "finite");
+    fails_loud("inf.tsv", "svd", "finite");
+}
+
+#[test]
+fn single_sample_fails_loud() {
+    fails_loud("single_sample.tsv", "eigh", "at least 2 samples");
+    fails_loud("single_sample.tsv", "svd", "at least 2 samples");
+}
